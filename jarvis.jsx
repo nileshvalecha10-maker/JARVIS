@@ -302,6 +302,11 @@ export default function Jarvis() {
 
   // ---------- Speech recognition setup ----------
   // Registered once. Uses handleCommand (stable identity) so no stale closures.
+  // recognitionStateRef tracks the actual browser-side state ('stopped' | 'starting' | 'running')
+  // so we never call start() while already starting/running, which throws InvalidStateError.
+  const recognitionStateRef = useRef('stopped');
+  const [lastError, setLastError] = useState(null);
+
   useEffect(() => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) {
@@ -312,6 +317,11 @@ export default function Jarvis() {
     rec.continuous = true;
     rec.interimResults = true;
     rec.lang = 'en-US';
+
+    rec.onstart = () => {
+      recognitionStateRef.current = 'running';
+      setLastError(null);
+    };
 
     rec.onresult = (e) => {
       let interim = '';
@@ -330,16 +340,37 @@ export default function Jarvis() {
     };
 
     rec.onerror = (e) => {
+      // Surface the real reason instead of swallowing it.
+      setLastError(e.error || 'unknown');
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
         setStatus('MIC ACCESS DENIED');
         setListening(false);
+      } else if (e.error === 'no-speech') {
+        // benign — recognition timed out waiting for speech, onend will handle restart
+      } else if (e.error === 'audio-capture') {
+        setStatus('NO MIC FOUND');
+        setListening(false);
+      } else if (e.error === 'network') {
+        setStatus('NETWORK ERROR');
+      } else if (e.error === 'aborted') {
+        // happens on intentional stop() — not a real error
+      } else {
+        setStatus(`ERROR: ${e.error}`);
       }
     };
 
     rec.onend = () => {
+      recognitionStateRef.current = 'stopped';
       // restart if still supposed to be listening (continuous mode)
       if (listeningRef.current) {
-        try { rec.start(); } catch {}
+        recognitionStateRef.current = 'starting';
+        try {
+          rec.start();
+        } catch (err) {
+          recognitionStateRef.current = 'stopped';
+          setLastError(err.message || 'start failed');
+          setListening(false);
+        }
       } else {
         setStatus('STANDBY');
       }
@@ -352,10 +383,22 @@ export default function Jarvis() {
     const rec = recognitionRef.current;
     if (!rec) return;
     if (listening) {
-      setStatus('LISTENING');
-      try { rec.start(); } catch {}
+      // Guard: only start if not already starting/running.
+      if (recognitionStateRef.current === 'stopped') {
+        setStatus('LISTENING');
+        recognitionStateRef.current = 'starting';
+        try {
+          rec.start();
+        } catch (err) {
+          recognitionStateRef.current = 'stopped';
+          setLastError(err.message || 'start failed');
+          setListening(false);
+        }
+      }
     } else {
-      try { rec.stop(); } catch {}
+      if (recognitionStateRef.current !== 'stopped') {
+        try { rec.stop(); } catch {}
+      }
     }
   }, [listening]);
 
@@ -428,6 +471,12 @@ export default function Jarvis() {
       {!supported && (
         <p className="text-amber-400 text-xs px-4 text-center mb-2">
           Voice recognition isn't supported in this browser. Use text input below.
+        </p>
+      )}
+
+      {lastError && (
+        <p className="text-red-400 text-xs px-4 text-center mb-2">
+          Mic error: {lastError}
         </p>
       )}
 
