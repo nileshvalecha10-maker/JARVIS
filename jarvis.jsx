@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Mic, MicOff, Volume2, VolumeX, Trash2, Power } from 'lucide-react';
+import { Mic, MicOff, Volume2, VolumeX, Trash2 } from 'lucide-react';
 
 // ---------- Helpers ----------
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -34,6 +34,21 @@ function safeEval(expr) {
   }
 }
 
+// Mock storage for local development (when not running inside claude.ai artifact host)
+const mockStorage = {
+  data: {},
+  async get(key) {
+    return { value: this.data[key] };
+  },
+  async set(key, value) {
+    this.data[key] = value;
+  },
+};
+
+if (!window.storage) {
+  window.storage = mockStorage;
+}
+
 // ---------- Main Component ----------
 export default function Jarvis() {
   const [listening, setListening] = useState(false);
@@ -49,6 +64,16 @@ export default function Jarvis() {
   const synthRef = useRef(window.speechSynthesis);
   const logEndRef = useRef(null);
   const timersRef = useRef({});
+
+  // Refs mirroring the latest state, so callbacks (especially ones registered
+  // once with speech recognition event handlers) never read stale values.
+  const memoryRef = useRef(memory);
+  const listeningRef = useRef(listening);
+  const speechEnabledRef = useRef(speechEnabled);
+
+  useEffect(() => { memoryRef.current = memory; }, [memory]);
+  useEffect(() => { listeningRef.current = listening; }, [listening]);
+  useEffect(() => { speechEnabledRef.current = speechEnabled; }, [speechEnabled]);
 
   // ---------- Load memory & log from storage ----------
   useEffect(() => {
@@ -85,68 +110,11 @@ export default function Jarvis() {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [log]);
 
-  // ---------- Speech recognition setup ----------
-  useEffect(() => {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) {
-      setSupported(false);
-      return;
-    }
-    const rec = new SR();
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.lang = 'en-US';
-
-    rec.onresult = (e) => {
-      let interim = '';
-      let final = '';
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) final += t;
-        else interim += t;
-      }
-      if (final) {
-        setTranscript('');
-        handleCommand(final.trim());
-      } else {
-        setTranscript(interim);
-      }
-    };
-
-    rec.onerror = (e) => {
-      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-        setStatus('MIC ACCESS DENIED');
-        setListening(false);
-      }
-    };
-
-    rec.onend = () => {
-      // restart if still supposed to be listening (continuous mode)
-      if (listening) {
-        try { rec.start(); } catch {}
-      } else {
-        setStatus('STANDBY');
-      }
-    };
-
-    recognitionRef.current = rec;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    const rec = recognitionRef.current;
-    if (!rec) return;
-    if (listening) {
-      setStatus('LISTENING');
-      try { rec.start(); } catch {}
-    } else {
-      try { rec.stop(); } catch {}
-    }
-  }, [listening]);
-
   // ---------- Speak ----------
+  // Stable identity (no deps) — always reads speechEnabledRef so it never goes stale,
+  // and can safely be referenced from the one-time speech recognition effect below.
   const speak = useCallback((text) => {
-    if (!speechEnabled || !synthRef.current) return;
+    if (!speechEnabledRef.current || !synthRef.current) return;
     try {
       synthRef.current.cancel();
       const u = new SpeechSynthesisUtterance(text);
@@ -158,13 +126,56 @@ export default function Jarvis() {
       if (preferred) u.voice = preferred;
       synthRef.current.speak(u);
     } catch {}
-  }, [speechEnabled]);
+  }, []);
 
   const addLog = useCallback((role, text) => {
     setLog(prev => [...prev, { id: uid(), role, text, time: Date.now() }]);
   }, []);
 
+  // Stable identity — reads listeningRef instead of closing over `listening`,
+  // so it's always safe to call from anywhere, including stale-prone callbacks.
+  const respond = useCallback((text) => {
+    addLog('jarvis', text);
+    speak(text);
+    setStatus(listeningRef.current ? 'LISTENING' : 'STANDBY');
+  }, [addLog, speak]);
+
+  // ---------- Claude API call ----------
+  // Stable identity — reads memoryRef instead of closing over `memory`.
+  const askClaude = useCallback(async (text) => {
+    setThinking(true);
+    setStatus('THINKING');
+    try {
+      const memoryContext = Object.entries(memoryRef.current)
+        .map(([k, v]) => `${k}: ${v}`)
+        .join('\n');
+
+      const systemPrompt = `You are JARVIS, a sharp, concise AI assistant. Keep responses short (1-3 sentences) since they will be spoken aloud. Use any stored facts below if relevant to answer.\n\nStored facts:\n${memoryContext || '(none yet)'}`;
+
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 1000,
+          system: systemPrompt,
+          messages: [{ role: 'user', content: text }],
+        }),
+      });
+      const data = await response.json();
+      const textBlock = data?.content?.find(c => c.type === 'text');
+      const reply = textBlock?.text?.trim() || "I couldn't process that.";
+      respond(reply);
+    } catch (e) {
+      respond("I'm having trouble reaching my reasoning core right now.");
+    } finally {
+      setThinking(false);
+    }
+  }, [respond]);
+
   // ---------- Command handling ----------
+  // Stable identity — reads memoryRef instead of closing over `memory`,
+  // so speech recognition's onresult handler (registered once) always sees current memory.
   const handleCommand = useCallback(async (text) => {
     if (!text) return;
     addLog('user', text);
@@ -192,7 +203,7 @@ export default function Jarvis() {
         }
         case 'recall': {
           const query = m[2].trim().toLowerCase();
-          const entries = Object.entries(memory);
+          const entries = Object.entries(memoryRef.current);
           const direct = entries.find(([k]) => k === query);
           if (direct) {
             respond(`${query} is ${direct[1]}.`);
@@ -210,7 +221,7 @@ export default function Jarvis() {
         }
         case 'forget': {
           const query = m[2].trim().toLowerCase();
-          const entries = Object.entries(memory);
+          const entries = Object.entries(memoryRef.current);
           const matchKey = entries.find(([k]) => k === query || k.includes(query))?.[0];
           if (matchKey) {
             setMemory(prev => {
@@ -225,7 +236,7 @@ export default function Jarvis() {
           return;
         }
         case 'listmemory': {
-          const entries = Object.entries(memory);
+          const entries = Object.entries(memoryRef.current);
           if (!entries.length) {
             respond('Memory is empty.');
           } else {
@@ -287,46 +298,66 @@ export default function Jarvis() {
 
     // Fallback: send to Claude for reasoning
     await askClaude(text);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [memory, log]);
+  }, [addLog, respond, askClaude]);
 
-  const respond = useCallback((text) => {
-    addLog('jarvis', text);
-    speak(text);
-    setStatus(listening ? 'LISTENING' : 'STANDBY');
-  }, [addLog, speak, listening]);
-
-  // ---------- Claude API call ----------
-  const askClaude = useCallback(async (text) => {
-    setThinking(true);
-    setStatus('THINKING');
-    try {
-      const memoryContext = Object.entries(memory)
-        .map(([k, v]) => `${k}: ${v}`)
-        .join('\n');
-
-      const systemPrompt = `You are JARVIS, a sharp, concise AI assistant. Keep responses short (1-3 sentences) since they will be spoken aloud. Use any stored facts below if relevant to answer.\n\nStored facts:\n${memoryContext || '(none yet)'}`;
-
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-6',
-          max_tokens: 1000,
-          system: systemPrompt,
-          messages: [{ role: 'user', content: text }],
-        }),
-      });
-      const data = await response.json();
-      const textBlock = data?.content?.find(c => c.type === 'text');
-      const reply = textBlock?.text?.trim() || "I couldn't process that.";
-      respond(reply);
-    } catch (e) {
-      respond("I'm having trouble reaching my reasoning core right now.");
-    } finally {
-      setThinking(false);
+  // ---------- Speech recognition setup ----------
+  // Registered once. Uses handleCommand (stable identity) so no stale closures.
+  useEffect(() => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      setSupported(false);
+      return;
     }
-  }, [memory, respond]);
+    const rec = new SR();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = 'en-US';
+
+    rec.onresult = (e) => {
+      let interim = '';
+      let final = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) final += t;
+        else interim += t;
+      }
+      if (final) {
+        setTranscript('');
+        handleCommand(final.trim());
+      } else {
+        setTranscript(interim);
+      }
+    };
+
+    rec.onerror = (e) => {
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        setStatus('MIC ACCESS DENIED');
+        setListening(false);
+      }
+    };
+
+    rec.onend = () => {
+      // restart if still supposed to be listening (continuous mode)
+      if (listeningRef.current) {
+        try { rec.start(); } catch {}
+      } else {
+        setStatus('STANDBY');
+      }
+    };
+
+    recognitionRef.current = rec;
+  }, [handleCommand]);
+
+  useEffect(() => {
+    const rec = recognitionRef.current;
+    if (!rec) return;
+    if (listening) {
+      setStatus('LISTENING');
+      try { rec.start(); } catch {}
+    } else {
+      try { rec.stop(); } catch {}
+    }
+  }, [listening]);
 
   // ---------- Manual text input fallback ----------
   const [manualInput, setManualInput] = useState('');
